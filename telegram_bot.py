@@ -63,7 +63,7 @@ def continue_inline_keyboard() -> InlineKeyboardMarkup:
 PROMPT_TEXT = (
     "🍪 Gửi Cookie theo định dạng:\n"
     "SPC_ST=....\n\n"
-    "📦 Hoặc gửi *Mã vận đơn* để xem hành trình:\n"
+    "📦 Hoặc gửi Mã vận đơn để xem hành trình:\n"
     "- SPX / SPXVN... (Shopee Express)\n"
     "- GY... (GHN)\n\n"
     "💡 Cookie: tối đa 10 dòng (mỗi cookie 1 dòng)."
@@ -114,7 +114,7 @@ def count_real_orders_from_api(data: Dict[str, Any]) -> int:
     return total
 
 # =======================
-# Tracking formatter
+# Tracking formatter (plain text - NO Markdown)
 # =======================
 def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 10) -> str:
     carrier = tdata.get("carrier", "")
@@ -124,25 +124,23 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 10) ->
 
     lines = []
     if carrier:
-        lines.append(f"🚚 *Đơn vị*: {carrier}")
+        lines.append(f"🚚 Đơn vị: {carrier}")
     if code:
-        lines.append(f"🧾 *MVĐ*: `{code}`")
+        lines.append(f"🧾 MVĐ: {code}")
     if status:
-        lines.append(f"📌 *Trạng thái*: {status}")
+        lines.append(f"📌 Trạng thái: {status}")
 
-    # GHN extra
     if tdata.get("from_address") and tdata.get("to_address"):
         lines.append(f"📦 Tuyến: {tdata['from_address']} ➜ {tdata['to_address']}")
     if tdata.get("to_name"):
         lines.append(f"👤 Người nhận: {tdata['to_name']}")
 
-    # SPX extra
     if tdata.get("raw_sls_tn"):
-        lines.append(f"🔎 *Mã liên kết*: `{tdata['raw_sls_tn']}`")
+        lines.append(f"🔎 Mã liên kết: {tdata['raw_sls_tn']}")
 
     evs = tdata.get("events") or []
     if evs:
-        lines.append("\n📍 *Hành trình gần nhất:*")
+        lines.append("\n📍 Hành trình gần nhất:")
         for e in evs[:max_events]:
             t = (e.get("time") or "").strip()
             st = (e.get("status") or "").strip()
@@ -163,9 +161,9 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 10) ->
 # =======================
 async def send_prompt(update: Update, *, via_query: bool = False):
     if via_query and update.callback_query:
-        await update.callback_query.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
+        await update.callback_query.message.reply_text(PROMPT_TEXT)
     else:
-        await update.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
+        await update.message.reply_text(PROMPT_TEXT)
 
 # =======================
 # Handlers
@@ -180,7 +178,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting"] = True
     await send_prompt(update)
-    return
 
 async def continue_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -192,17 +189,16 @@ async def continue_check_callback(update: Update, context: ContextTypes.DEFAULT_
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    # Nếu user bấm lại nút trên keyboard
+    # user bấm nút keyboard
     if text == BTN_CHECK:
         await handle_check_button(update, context)
         return
 
-    # Nếu chưa vào chế độ check -> hướng dẫn
+    # chưa vào chế độ check
     if not context.user_data.get("awaiting"):
         await start(update, context)
         return
 
-    # Đang ở chế độ check -> xử lý input
     raw = text
     if not raw:
         await update.message.reply_text("❌ Bạn chưa gửi gì cả. Gửi lại giúp mình nhé.")
@@ -228,11 +224,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             msg = format_tracking_for_telegram(tdata, max_events=10)
-            await update.message.reply_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=continue_inline_keyboard()
-            )
+            await update.message.reply_text(msg, reply_markup=continue_inline_keyboard())
         except Exception as e:
             await update.message.reply_text(
                 f"❌ Lỗi check vận đơn: {e}",
@@ -258,12 +250,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if invalid:
         await update.message.reply_text(
-            "❌ Không nhận diện được *MVĐ* và Cookie cũng không hợp lệ.\n\n"
+            "❌ Không nhận diện được MVĐ và Cookie cũng không hợp lệ.\n\n"
             "✅ Gửi:\n"
-            "• Cookie: `SPC_ST=....`\n"
-            "• Hoặc MVĐ: `SPXVN...` / `SPX...` / `GY...`\n\n"
+            "• Cookie: SPC_ST=....\n"
+            "• Hoặc MVĐ: SPXVN... / SPX... / GY...\n\n"
             "Chi tiết lỗi cookie:\n" + "\n".join(invalid),
-            parse_mode="Markdown",
             reply_markup=continue_inline_keyboard()
         )
         return
@@ -273,7 +264,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await asyncio.to_thread(fetch_orders, cookies)
 
-        # Chặn placeholder “đang chờ” khi cookie sai/hết hạn
         if count_real_orders_from_api(data) == 0:
             await update.message.reply_text(
                 "❌ Cookie sai / hết hạn hoặc không có dữ liệu đơn hợp lệ.\n"
@@ -283,15 +273,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         messages = format_orders_for_telegram(data, max_orders_per_cookie=5)
+
+        # QUAN TRỌNG: KHÔNG parse_mode -> tránh lỗi entity
         for i, msg in enumerate(messages):
             if i == len(messages) - 1:
-                await update.message.reply_text(
-                    msg,
-                    parse_mode="Markdown",
-                    reply_markup=continue_inline_keyboard()
-                )
+                await update.message.reply_text(msg, reply_markup=continue_inline_keyboard())
             else:
-                await update.message.reply_text(msg, parse_mode="Markdown")
+                await update.message.reply_text(msg)
 
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi: {e}", reply_markup=continue_inline_keyboard())
