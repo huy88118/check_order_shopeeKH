@@ -274,12 +274,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         messages = format_orders_for_telegram(data, max_orders_per_cookie=5)
 
-        # QUAN TRỌNG: KHÔNG parse_mode -> tránh lỗi entity
         for i, msg in enumerate(messages):
-            if i == len(messages) - 1:
-                await update.message.reply_text(msg, reply_markup=continue_inline_keyboard())
-            else:
-                await update.message.reply_text(msg)
+    if i == len(messages) - 1:
+        await update.message.reply_text(
+            msg,
+            parse_mode="HTML",
+            reply_markup=continue_inline_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            msg,
+            parse_mode="HTML"
+        )
 
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi: {e}", reply_markup=continue_inline_keyboard())
