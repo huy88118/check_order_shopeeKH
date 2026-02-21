@@ -17,17 +17,12 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     ContextTypes,
     filters,
 )
 
 from order_service import fetch_orders, format_orders_for_telegram
-from tracking_service import (
-    detect_tracking_carrier,
-    fetch_tracking_spx,
-    fetch_tracking_ghn,
-)
+from tracking_service import detect_tracking_carrier, fetch_tracking_spx, fetch_tracking_ghn
 
 # =======================
 # Flask keep-alive (Render)
@@ -50,9 +45,6 @@ def run_web():
 # Config
 # =======================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-# Conversation state
-WAIT_INPUT = 1
 
 # =======================
 # UI
@@ -99,7 +91,6 @@ def _get_any(d: Dict[str, Any], keys: List[str], default=None):
 def is_real_order(order: Dict[str, Any]) -> bool:
     if not isinstance(order, dict):
         return False
-
     order_id = _get_any(order, ["order_id", "orderid", "id"], "")
     tracking = _get_any(order, ["tracking_number", "tracking_no", "tracking"], "")
 
@@ -168,32 +159,56 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 10) ->
     return "\n".join(lines).strip()
 
 # =======================
+# Helpers
+# =======================
+async def send_prompt(update: Update, *, via_query: bool = False):
+    if via_query and update.callback_query:
+        await update.callback_query.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
+
+# =======================
 # Handlers
 # =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting"] = False
     await update.message.reply_text(
         "✅ Bot Check Đơn Shopee\n\nBấm nút bên dưới để bắt đầu.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard()
     )
 
 async def handle_check_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
-    return WAIT_INPUT
+    context.user_data["awaiting"] = True
+    await send_prompt(update)
+    return
 
 async def continue_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.message.reply_text(PROMPT_TEXT, parse_mode="Markdown")
-    # Không END — để user gửi tiếp trong state WAIT_INPUT
-    return WAIT_INPUT
+    q = update.callback_query
+    await q.answer()
+    context.user_data["awaiting"] = True
+    await q.message.reply_text("🔁 OK, gửi Cookie hoặc MVĐ để check tiếp nhé!")
+    await send_prompt(update, via_query=True)
 
-async def receive_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = (update.message.text or "").strip()
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    # Nếu user bấm lại nút trên keyboard
+    if text == BTN_CHECK:
+        await handle_check_button(update, context)
+        return
+
+    # Nếu chưa vào chế độ check -> hướng dẫn
+    if not context.user_data.get("awaiting"):
+        await start(update, context)
+        return
+
+    # Đang ở chế độ check -> xử lý input
+    raw = text
     if not raw:
         await update.message.reply_text("❌ Bạn chưa gửi gì cả. Gửi lại giúp mình nhé.")
-        return WAIT_INPUT
+        return
 
-    # 1) Nếu là MVĐ => tracking
+    # 1) MVĐ?
     single = raw.replace(" ", "").strip()
     carrier = detect_tracking_carrier(single)
     if carrier:
@@ -208,32 +223,33 @@ async def receive_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "❌ Không lấy được hành trình vận đơn.\n"
                     f"Chi tiết: {tdata.get('error','')}",
-                    reply_markup=continue_inline_keyboard(),
+                    reply_markup=continue_inline_keyboard()
                 )
-                return WAIT_INPUT
+                return
 
             msg = format_tracking_for_telegram(tdata, max_events=10)
             await update.message.reply_text(
-                msg, parse_mode="Markdown", reply_markup=continue_inline_keyboard()
+                msg,
+                parse_mode="Markdown",
+                reply_markup=continue_inline_keyboard()
             )
         except Exception as e:
             await update.message.reply_text(
                 f"❌ Lỗi check vận đơn: {e}",
-                reply_markup=continue_inline_keyboard(),
+                reply_markup=continue_inline_keyboard()
             )
+        return
 
-        return WAIT_INPUT
-
-    # 2) Nếu là cookie => check đơn
+    # 2) Cookie (có thể nhiều dòng)
     cookies = [line.strip() for line in raw.splitlines() if line.strip()]
 
     if not cookies:
         await update.message.reply_text("❌ Cookie trống. Gửi lại giúp mình nhé.")
-        return WAIT_INPUT
+        return
 
     if len(cookies) > 10:
         await update.message.reply_text("❌ Tối đa 10 cookie. Bạn gửi lại giúp mình nhé (<=10 dòng).")
-        return WAIT_INPUT
+        return
 
     invalid = []
     for i, c in enumerate(cookies, start=1):
@@ -248,9 +264,9 @@ async def receive_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Hoặc MVĐ: `SPXVN...` / `SPX...` / `GY...`\n\n"
             "Chi tiết lỗi cookie:\n" + "\n".join(invalid),
             parse_mode="Markdown",
-            reply_markup=continue_inline_keyboard(),
+            reply_markup=continue_inline_keyboard()
         )
-        return WAIT_INPUT
+        return
 
     await update.message.reply_text("⏳ Đang check đơn hàng...")
 
@@ -262,24 +278,23 @@ async def receive_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "❌ Cookie sai / hết hạn hoặc không có dữ liệu đơn hợp lệ.\n"
                 "👉 Hãy lấy lại SPC_ST mới và thử lại.",
-                reply_markup=continue_inline_keyboard(),
+                reply_markup=continue_inline_keyboard()
             )
-            return WAIT_INPUT
+            return
 
         messages = format_orders_for_telegram(data, max_orders_per_cookie=5)
         for i, msg in enumerate(messages):
-            # chỉ gắn nút continue ở tin cuối
             if i == len(messages) - 1:
                 await update.message.reply_text(
-                    msg, parse_mode="Markdown", reply_markup=continue_inline_keyboard()
+                    msg,
+                    parse_mode="Markdown",
+                    reply_markup=continue_inline_keyboard()
                 )
             else:
                 await update.message.reply_text(msg, parse_mode="Markdown")
 
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi: {e}", reply_markup=continue_inline_keyboard())
-
-    return WAIT_INPUT
 
 def main():
     if not TOKEN:
@@ -289,21 +304,9 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(rf"^{re.escape(BTN_CHECK)}$"), handle_check_button)],
-        states={WAIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_input)]},
-        fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True,
-    )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
-
-    # CallbackQueryHandler phải add global (ngoài ConversationHandler) để bắt chắc
     app.add_handler(CallbackQueryHandler(continue_check_callback, pattern=f"^{CB_CONTINUE}$"))
-
-    # nếu user gõ linh tinh ngoài flow
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("✅ check_order_shopee bot running...")
     app.run_polling(drop_pending_updates=True)
