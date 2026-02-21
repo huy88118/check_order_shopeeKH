@@ -114,7 +114,7 @@ def count_real_orders_from_api(data: Dict[str, Any]) -> int:
     return total
 
 # =======================
-# Tracking formatter (plain text - NO Markdown)
+# Tracking formatter (plain text)
 # =======================
 def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 10) -> str:
     carrier = tdata.get("carrier", "")
@@ -275,20 +275,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages = format_orders_for_telegram(data, max_orders_per_cookie=5)
 
         for i, msg in enumerate(messages):
-    if i == len(messages) - 1:
-        await update.message.reply_text(
-            msg,
-            parse_mode="HTML",
-            reply_markup=continue_inline_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            msg,
-            parse_mode="HTML"
-        )
+            # order_service đã trả HTML-safe, nên dùng parse_mode="HTML"
+            if i == len(messages) - 1:
+                await update.message.reply_text(
+                    msg,
+                    parse_mode="HTML",
+                    reply_markup=continue_inline_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    msg,
+                    parse_mode="HTML"
+                )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi: {e}", reply_markup=continue_inline_keyboard())
+        await update.message.reply_text(
+            f"❌ Lỗi: {e}",
+            reply_markup=continue_inline_keyboard()
+        )
 
 def main():
     if not TOKEN:
