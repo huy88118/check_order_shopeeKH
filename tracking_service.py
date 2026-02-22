@@ -70,12 +70,12 @@ def _fmt_iso_z(s: Any) -> str:
 # =========================
 def fetch_tracking_spx(spx_tn: str, language_code: str = "vi", timeout: int = 25) -> Dict[str, Any]:
     """
-    API SPX public bạn bắt được:
     GET https://spx.vn/shipment/order/open/order/get_order_info?spx_tn=...&language_code=vi
 
     Return:
       {
         ok: bool,
+        carrier_code: "SPX",
         carrier: str,
         code: str,
         current_status: str,
@@ -107,22 +107,26 @@ def fetch_tracking_spx(spx_tn: str, language_code: str = "vi", timeout: int = 25
     except Exception as e:
         return {
             "ok": False,
+            "carrier_code": "SPX",
             "carrier": "Shopee Express (SPX)",
             "code": code,
             "current_status": "Không gọi được API SPX.",
             "events": [],
             "link": link,
+            "raw_sls_tn": "",
             "error": str(e),
         }
 
     if not isinstance(j, dict) or j.get("retcode") != 0:
         return {
             "ok": False,
+            "carrier_code": "SPX",
             "carrier": "Shopee Express (SPX)",
             "code": code,
             "current_status": "Không lấy được tracking SPX (retcode != 0).",
             "events": [],
             "link": link,
+            "raw_sls_tn": "",
             "error": str(j),
         }
 
@@ -139,13 +143,10 @@ def fetch_tracking_spx(spx_tn: str, language_code: str = "vi", timeout: int = 25
         detail = (rec.get("buyer_description") or rec.get("description") or "").strip()
         status = (rec.get("tracking_name") or rec.get("milestone_name") or "").strip()
 
-        # Nếu muốn lọc record ẩn (display_flag = 0) thì mở dòng dưới:
-        # if int(rec.get("display_flag") or 0) == 0:
-        #     continue
-
         if t or status or detail:
             events.append({"time": t, "status": status, "detail": detail})
 
+    # SPX thường trả record mới nhất trước (theo bạn test), nên current_status lấy events[0]
     current_status = ""
     if events:
         e0 = events[0]
@@ -153,12 +154,13 @@ def fetch_tracking_spx(spx_tn: str, language_code: str = "vi", timeout: int = 25
 
     return {
         "ok": True,
+        "carrier_code": "SPX",
         "carrier": "Shopee Express (SPX)",
         "code": code,
         "current_status": current_status or "Đã lấy dữ liệu nhưng không có record.",
         "events": events,
         "link": link,
-        "raw_sls_tn": sls.get("sls_tn") or "",
+        "raw_sls_tn": (sls.get("sls_tn") or "").strip(),
     }
 
 
@@ -167,19 +169,19 @@ def fetch_tracking_spx(spx_tn: str, language_code: str = "vi", timeout: int = 25
 # =========================
 def fetch_tracking_ghn(order_code: str, timeout: int = 25) -> Dict[str, Any]:
     """
-    API GHN public bạn bắt được:
     POST https://fe-online-gateway.ghn.vn/order-tracking/public-api/client/tracking-logs
-    Payload chuẩn: {"order_code": "GY...."}
+    Payload: {"order_code": "GY...."}
 
     Return:
       {
         ok: bool,
+        carrier_code: "GHN",
         carrier: str,
         code: str,
         current_status: str,
-        events: [{time,status,detail}],
+        events: [{time,status,detail}]  # ✅ đảm bảo mới nhất ở trên
         link: str,
-        from_address/to_address/to_name: str (nếu có),
+        from_address/to_address/to_name: str,
         error: str (nếu lỗi)
       }
     """
@@ -203,22 +205,30 @@ def fetch_tracking_ghn(order_code: str, timeout: int = 25) -> Dict[str, Any]:
     except Exception as e:
         return {
             "ok": False,
+            "carrier_code": "GHN",
             "carrier": "Giao Hàng Nhanh (GHN)",
             "code": code,
             "current_status": "Không gọi được API GHN.",
             "events": [],
             "link": link,
+            "from_address": "",
+            "to_address": "",
+            "to_name": "",
             "error": str(e),
         }
 
     if not isinstance(j, dict) or j.get("code") != 200:
         return {
             "ok": False,
+            "carrier_code": "GHN",
             "carrier": "Giao Hàng Nhanh (GHN)",
             "code": code,
             "current_status": "GHN API trả lỗi (code != 200).",
             "events": [],
             "link": link,
+            "from_address": "",
+            "to_address": "",
+            "to_name": "",
             "error": str(j),
         }
 
@@ -242,8 +252,13 @@ def fetch_tracking_ghn(order_code: str, timeout: int = 25) -> Dict[str, Any]:
         if t or status or detail:
             events.append({"time": t, "status": status, "detail": detail})
 
+    # ✅ GHN thường trả cũ -> mới => đảo lại để mới nhất ở trên
+    if len(events) >= 2:
+        events = events[::-1]
+
     return {
         "ok": True,
+        "carrier_code": "GHN",
         "carrier": "Giao Hàng Nhanh (GHN)",
         "code": code,
         "current_status": current_status or "Không rõ trạng thái",
