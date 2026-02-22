@@ -116,16 +116,6 @@ def count_real_orders_from_api(data: Dict[str, Any]) -> int:
 # =======================
 # Tracking formatter (plain text)
 # =======================
-def _is_ghn_tracking(tdata: Dict[str, Any]) -> bool:
-    """
-    Ưu tiên dựa vào carrier_code (nếu tracking_service set),
-    fallback bằng chuỗi carrier.
-    """
-    if (tdata.get("carrier_code") or "").upper() == "GHN":
-        return True
-    carrier = str(tdata.get("carrier", "")).upper()
-    return carrier.startswith("GHN") or carrier.startswith("GIAO HANG NHANH")
-
 def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 5) -> str:
     carrier = tdata.get("carrier", "")
     code = tdata.get("code", "")
@@ -148,18 +138,13 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 5) -> 
     if tdata.get("raw_sls_tn"):
         lines.append(f"🔎 Mã liên kết: {tdata['raw_sls_tn']}")
 
-    # ✅ FIX: evs phải lấy ở đây, KHÔNG nằm trong if raw_sls_tn
+    # ✅ events đã được tracking_service sắp đúng thứ tự:
+    # - SPX: đã đúng
+    # - GHN: tracking_service đã đảo mới nhất lên trên
     evs = tdata.get("events") or []
     if evs:
-        # GHN thường trả cũ -> mới => đảo để mới nhất lên trên
-        if _is_ghn_tracking(tdata):
-            evs_view = list(evs)[::-1]
-        else:
-            # SPX đang đúng thứ tự => giữ nguyên
-            evs_view = evs
-
         lines.append("\n📍 Hành trình gần nhất (mới nhất ở trên):")
-        for e in evs_view[:max_events]:
+        for e in evs[:max_events]:
             t = (e.get("time") or "").strip()
             st = (e.get("status") or "").strip()
             de = (e.get("detail") or "").strip()
@@ -167,7 +152,7 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 5) -> 
             if one:
                 lines.append(f"• {one}")
 
-        remain = len(evs_view) - max_events
+        remain = len(evs) - max_events
         if remain > 0:
             lines.append(f"… +{remain} dòng khác (Mở link để xem full hành trình)")
 
@@ -243,7 +228,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # ✅ hiển thị đúng 5 dòng
             msg = format_tracking_for_telegram(tdata, max_events=5)
             await update.message.reply_text(msg, reply_markup=continue_inline_keyboard())
         except Exception as e:
@@ -296,7 +280,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages = format_orders_for_telegram(data, max_orders_per_cookie=5)
 
         for i, msg in enumerate(messages):
-            # order_service đã trả HTML-safe, nên dùng parse_mode="HTML"
             if i == len(messages) - 1:
                 await update.message.reply_text(
                     msg,
