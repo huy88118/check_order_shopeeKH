@@ -2,9 +2,10 @@ import os
 import threading
 import asyncio
 import re
-from typing import List, Dict, Any
+import time
+from typing import List, Dict, Any, Tuple
 
-from flask import Flask
+from flask import Flask, request, jsonify
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -40,6 +41,91 @@ def ping():
 def run_web():
     port = int(os.getenv("PORT", "10000"))
     web_app.run(host="0.0.0.0", port=port)
+
+# =======================
+# ✅ GHN PROXY FOR GOOGLE SHEET (Apps Script)
+# =======================
+# Bật bảo mật bằng API key (khuyên dùng):
+# - set env SHEET_API_KEY trên Render/VPS
+# - Apps Script gửi header: x-api-key: <SHEET_API_KEY>
+SHEET_API_KEY = os.getenv("SHEET_API_KEY", "").strip()
+
+# Rate limit nhẹ theo IP: mặc định 30 req / 60 giây
+RL_MAX = int(os.getenv("SHEET_RL_MAX", "30"))
+RL_WINDOW_SEC = int(os.getenv("SHEET_RL_WINDOW_SEC", "60"))
+
+# cache nhỏ để tránh gọi GHN liên tục (mặc định cache 30 giây)
+CACHE_TTL_SEC = int(os.getenv("SHEET_CACHE_TTL_SEC", "30"))
+_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # order_code -> (expire_ts, result)
+_rl: Dict[str, Tuple[float, int]] = {}  # ip -> (window_start_ts, count)
+
+def _client_ip() -> str:
+    # Render/Proxy thường có X-Forwarded-For
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+def _rate_limited(ip: str) -> bool:
+    now = time.time()
+    win_start, cnt = _rl.get(ip, (now, 0))
+    if now - win_start >= RL_WINDOW_SEC:
+        _rl[ip] = (now, 1)
+        return False
+    if cnt >= RL_MAX:
+        return True
+    _rl[ip] = (win_start, cnt + 1)
+    return False
+
+def _cache_get(code: str) -> Dict[str, Any] | None:
+    now = time.time()
+    item = _cache.get(code)
+    if not item:
+        return None
+    exp, data = item
+    if now >= exp:
+        _cache.pop(code, None)
+        return None
+    return data
+
+def _cache_set(code: str, data: Dict[str, Any]) -> None:
+    _cache[code] = (time.time() + CACHE_TTL_SEC, data)
+
+@web_app.post("/api/ghn-track")
+def ghn_track_proxy():
+    # 1) API key (nếu có set)
+    if SHEET_API_KEY:
+        if request.headers.get("x-api-key", "") != SHEET_API_KEY:
+            return jsonify({"ok": False, "error": "Unauthorized"}), 403
+
+    # 2) rate limit theo IP
+    ip = _client_ip()
+    if _rate_limited(ip):
+        return jsonify({"ok": False, "error": "Rate limited"}), 429
+
+    # 3) parse body
+    data = request.get_json(silent=True) or {}
+    code = (data.get("order_code") or "").strip().upper()
+    if not code:
+        return jsonify({"ok": False, "error": "Missing order_code"}), 400
+
+    # 4) cache
+    cached = _cache_get(code)
+    if cached:
+        # trả cached + flag
+        out = dict(cached)
+        out["_cached"] = True
+        return jsonify(out), 200
+
+    # 5) gọi GHN (dùng hàm sẵn có)
+    try:
+        result = fetch_tracking_ghn(code)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "code": code}), 500
+
+    # cache lại cả ok/failed để giảm spam
+    _cache_set(code, result)
+    return jsonify(result), 200
 
 # =======================
 # Config
@@ -138,9 +224,6 @@ def format_tracking_for_telegram(tdata: Dict[str, Any], max_events: int = 5) -> 
     if tdata.get("raw_sls_tn"):
         lines.append(f"🔎 Mã liên kết: {tdata['raw_sls_tn']}")
 
-    # ✅ events đã được tracking_service sắp đúng thứ tự:
-    # - SPX: đã đúng
-    # - GHN: tracking_service đã đảo mới nhất lên trên
     evs = tdata.get("events") or []
     if evs:
         lines.append("\n📍 Hành trình gần nhất (mới nhất ở trên):")
@@ -194,12 +277,10 @@ async def continue_check_callback(update: Update, context: ContextTypes.DEFAULT_
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
-    # user bấm nút keyboard
     if text == BTN_CHECK:
         await handle_check_button(update, context)
         return
 
-    # chưa vào chế độ check
     if not context.user_data.get("awaiting"):
         await start(update, context)
         return
