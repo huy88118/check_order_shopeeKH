@@ -178,6 +178,7 @@ def _fetch_vubel(session, api_key, cookie, proxy_url):
     data = payload.get("data")
     if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
         raise VubelError("Vubel thiếu data.orders; không thể kết luận tài khoản không có đơn.")
+    _log_order_field_names(data["orders"])
     return {"cookieInvalid": False, "orders": data["orders"],
             "account": data.get("account") if isinstance(data.get("account"), dict) else {}}
 
@@ -266,25 +267,139 @@ def _link(item, order):
     return ""
 
 
-def _item_lists(order):
-    items = _first(order, "items", "products", "product_info", "item_list") or []
-    if isinstance(items, dict):
-        items = [items]
-    if not isinstance(items, list):
-        items = []
-    # Some Vubel payloads may group products in shops[].items.
-    if not items:
-        shops = _first(order, "shops") or []
-        if isinstance(shops, list):
-            for shop in shops:
-                if isinstance(shop, dict):
-                    nested = _first(shop, "items", "products", "item_list") or []
-                    if isinstance(nested, list):
-                        for item in nested:
-                            if isinstance(item, dict):
-                                items.append(dict(item, shop_id=item.get("shop_id") or shop.get("shopId") or shop.get("shop_id")))
-    return [x for x in items if isinstance(x, dict)]
+def _product_fields(item):
+    """Collect product fields, but never confuse order.total with unit price."""
+    if not isinstance(item, dict):
+        return {}
+    obj = item.get("item")
+    if isinstance(obj, dict):
+        item = {**obj, **{k: v for k, v in item.items() if k != "item"}}
+    return item
 
+
+def _item_lists(order):
+    """Read optional Vubel item fields AND familiar nested Shopee orderDetail structures.
+
+    The published /v1/shopee/get_order example omits all product data. This
+    function only returns actual item records if the real response contains them.
+    """
+    if not isinstance(order, dict):
+        return []
+
+    group_keys = (
+        "items", "products", "item_list", "itemList", "order_items", "orderItems",
+        "product_list", "productList", "line_items", "lineItems", "shops",
+        "info_card", "infoCard", "parcel_cards", "parcelCards", "product_info",
+        "productInfo", "item_groups", "itemGroups", "item_details", "itemDetails",
+        "product_details", "productDetails", "shipping", "shipments",
+        "order_detail", "orderDetail", "orderDetails", "details", "item", "product",
+    )
+    result = []
+    seen = set()
+    queue = [(order, {}, 0)]
+    visited_nodes = set()
+
+    while queue and len(result) < 100:
+        node, inherited, depth = queue.pop(0)
+        if depth > 10 or not isinstance(node, dict):
+            continue
+        if id(node) in visited_nodes:
+            continue
+        visited_nodes.add(id(node))
+        node_shop = _first(node, "shop_id", "shopid", "shopId") or inherited.get("shop_id")
+        ctx = dict(inherited)
+        if node_shop:
+            ctx["shop_id"] = node_shop
+
+        # A product must have its own *name*. A recipient or a shop name is
+        # never a substitute, and the order itself is not treated as a product.
+        product_name = _first(node, "itemName", "item_name", "product_name",
+                              "productName", "product_title", "productTitle")
+        if depth > 0 and product_name is None and any(k in node for k in
+            ("item_id", "itemid", "itemId", "model_id", "modelId", "item_price", "model_price")):
+            product_name = _first(node, "name", "title")
+        if depth > 0 and product_name is None and inherited.get("in_item_list"):
+            product_name = _first(node, "name", "title")
+        # Flat order responses can contain a single explicitly named product.
+        if product_name not in (None, "") and (depth > 0 or any(
+            k in node for k in ("product_name", "productName", "item_name", "itemName")
+        )):
+            item = dict(node)
+            if ctx.get("shop_id") and not _first(item, "shop_id", "shopid", "shopId"):
+                item["shop_id"] = ctx["shop_id"]
+            if isinstance(item.get("item"), dict):
+                item = _product_fields(item)
+            ident = (_first(item, "item_id", "itemid", "itemId", "product_id", "productId"),
+                     _first(item, "model_id", "modelId", "model_name", "modelName"),
+                     str(product_name), str(_first(item, "price", "item_price", "model_price") or ""))
+            if ident not in seen:
+                seen.add(ident)
+                result.append(item)
+
+        for key in group_keys:
+            child = node.get(key)
+            if isinstance(child, dict):
+                queue.append((child, {**ctx, "in_item_list": inherited.get("in_item_list") or key in (
+                    "items", "products", "item_list", "itemList", "order_items", "orderItems",
+                    "product_list", "productList", "line_items", "lineItems", "item", "product")}, depth + 1))
+            elif isinstance(child, list):
+                for entry in child[:100]:
+                    if isinstance(entry, dict):
+                        queue.append((entry, {**ctx, "in_item_list": key in (
+                            "items", "products", "item_list", "itemList", "order_items", "orderItems",
+                            "product_list", "productList", "line_items", "lineItems")}, depth + 1))
+    return result
+
+
+def _price_text(value):
+    """Format documented VND amounts without guessing Shopee internal price units."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, dict):
+        value = _first(value, "display", "display_value", "formatted", "value", "amount")
+        if value is None:
+            return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if abs(value) >= 1_000_000_000:
+            # Some raw Shopee APIs use internal scaling (often 1e5).
+            # The Vubel spec does not document the price unit. Do not guess.
+            return f"{value} (giá trị thô; chưa xác định đơn vị)"
+        return f"{value:,.0f}".replace(",", ".") + "đ" if value == int(value) else str(value) + "đ"
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{1,3}(?:[,.]\d{3})+", text):
+        return text + "đ"
+    if text.isdigit():
+        return _price_text(int(text))
+    return text
+
+
+def _price_from_item(item):
+    unit = _first(item, "price_paid", "paidPrice", "priceAfterDiscount",
+                  "price_after_discount", "discountedPrice", "discount_price",
+                  "price_vnd", "priceVnd", "unit_price", "unitPrice", "item_price",
+                  "itemPrice", "model_price", "modelPrice", "product_price",
+                  "productPrice", "current_price", "sale_price", "salePrice", "price")
+    line_total = _first(item, "subtotal", "line_total", "lineTotal", "item_total",
+                        "itemTotal", "total_price", "totalPrice")
+    return _price_text(unit), _price_text(line_total)
+
+
+def _log_order_field_names(orders):
+    """Opt-in schema diagnostics: field names only, never cookies or values."""
+    if os.getenv("VUBEL_DEBUG_FIELDS", "").strip() != "1":
+        return
+    import logging
+    if not orders:
+        logging.info("Vubel order schema: empty orders list")
+        return
+    order = next((o for o in orders if isinstance(o, dict)), {})
+    def keys(node):
+        return sorted(str(k) for k in node.keys())[:65] if isinstance(node, dict) else []
+    items = _item_lists(order)
+    logging.info("Vubel order schema keys=%s; item_count=%d; item_keys=%s",
+                 keys(order), len(items), keys(items[0]) if items else [])
 
 def _shipment(order):
     ship = _first(order, "shipping", "shipment", "logistics") or {}
@@ -338,9 +453,13 @@ def _format_order(order, idx, max_products):
     items = _item_lists(order)
     displayed = 0
     for item in items[:max_products]:
-        name = _first(item, "name", "itemName", "product_name", "title", "item_name")
-        variation = _first(item, "variation", "model_name", "modelName", "model", "variation_name")
-        qty = _first(item, "quantity", "qty", "model_quantity_purchased")
+        name = _first(item, "name", "itemName", "item_name", "product_name",
+                      "productName", "product_title", "productTitle", "title")
+        variation = _first(item, "variation", "model_name", "modelName", "model",
+                           "variation_name", "variationName", "model_label")
+        qty = _first(item, "quantity", "qty", "model_quantity_purchased",
+                     "quantityPurchased", "quantity_purchased", "item_quantity")
+        unit_price, line_total = _price_from_item(item)
         link = _link(item, order)
         lines_item = [f"\n🛍 <b>SẢN PHẨM {displayed + 1}</b>"]
         if name:
@@ -349,6 +468,9 @@ def _format_order(order, idx, max_products):
             lines_item.append("Phân loại: " + _t(variation, 100))
         if qty is not None:
             lines_item.append("Số lượng: " + _t(qty))
+        lines_item.append("Giá sản phẩm: " + _t(unit_price or "API không cung cấp"))
+        if line_total:
+            lines_item.append("Thành tiền sản phẩm: " + _t(line_total))
         if link:
             lines_item.append("Liên kết: " + _t(link, 500))
         if len("\n".join(lines + lines_item)) > 2950:
@@ -356,7 +478,7 @@ def _format_order(order, idx, max_products):
         lines.extend(lines_item)
         displayed += 1
     if not items:
-        lines.append("\n🛍 <b>SẢN PHẨM</b>\nAPI không trả chi tiết sản phẩm/link")
+        lines.append("\n🛍 <b>SẢN PHẨM</b>\nTên sản phẩm: API không cung cấp\nGiá sản phẩm: API không cung cấp")
     elif displayed < len(items):
         lines.append(f"… còn {len(items) - displayed} sản phẩm không hiển thị trong tin này")
     lines.append("\n🚚 <b>ĐƠN VỊ VẬN CHUYỂN</b>")
