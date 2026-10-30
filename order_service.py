@@ -7,6 +7,7 @@ can have its own Shopee link preview. No product images are sent separately.
 """
 
 import html
+import logging
 import os
 import re
 import threading
@@ -27,6 +28,7 @@ HEADERS = {
     "Referer": "https://autopee.vercel.app/",
 }
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+_LOGGER = logging.getLogger(__name__)
 
 
 # Cùng quy tắc proxy với Google Apps Script, nhưng đây là kết nối HTTP(S)
@@ -157,22 +159,52 @@ def fetch_orders(cookies_list: List[str]) -> Dict[str, Any]:
             # Không sử dụng proxy môi trường của máy chủ thay thế KiotProxy.
             session.trust_env = False
             proxy_url = _acquire_kiot_proxy(session, key, region)
-            try:
-                response = session.post(
-                    BASE_URL + API_ENDPOINT,
-                    json={"cookies": cookies_list},
-                    headers=HEADERS,
-                    proxies={"http": proxy_url, "https": proxy_url},
-                    timeout=(15, 60),
-                )
-            except requests.exceptions.ProxyError:
-                raise KiotProxyError("Không kết nối được HTTP proxy KiotProxy; dừng check.") from None
-            except requests.exceptions.Timeout:
-                raise KiotProxyError("Quá thời gian chờ API qua KiotProxy; thử lại sau.") from None
-            except requests.RequestException:
-                raise RuntimeError("Lỗi kết nối API đơn hàng qua proxy; không gửi trực tiếp.") from None
+            # 503 thường là lỗi tạm thời ở dịch vụ đích hoặc gateway. Chỉ thử lại
+            # tối đa một lần với CÙNG proxy; tuyệt đối không fallback direct hoặc
+            # xin IP mới trong lúc API đang báo 503.
+            for attempt in range(2):
+                try:
+                    response = session.post(
+                        BASE_URL + API_ENDPOINT,
+                        json={"cookies": cookies_list},
+                        headers=HEADERS,
+                        proxies={"http": proxy_url, "https": proxy_url},
+                        timeout=(15, 60),
+                    )
+                except requests.exceptions.ProxyError:
+                    raise KiotProxyError("Không kết nối được HTTP proxy KiotProxy; dừng check.") from None
+                except requests.exceptions.Timeout:
+                    raise KiotProxyError("Quá thời gian chờ API qua KiotProxy; thử lại sau.") from None
+                except requests.RequestException:
+                    raise RuntimeError("Lỗi kết nối API đơn hàng qua proxy; không gửi trực tiếp.") from None
+
+                # Chỉ log các header vô hại, KHÔNG log response body, cookie,
+                # IP proxy, key hoặc full URL. Header server/via có thể giúp
+                # nhận biết 503 do gateway proxy hay cloud function trả về.
+                if response.status_code >= 500:
+                    safe_headers = {}
+                    for field in ("Server", "Via", "Content-Type", "Retry-After"):
+                        value = str(response.headers.get(field, ""))[:100]
+                        value = re.sub(r"[^a-zA-Z0-9_. /;:+\-]", "?", value)
+                        if value:
+                            safe_headers[field] = value
+                    _LOGGER.warning(
+                        "Shopee order API: HTTP %s, attempt=%s/2, response_headers=%s",
+                        response.status_code, attempt + 1, safe_headers,
+                    )
+
+                if response.status_code != 503 or attempt == 1:
+                    break
+                time.sleep(2)
+
     if response.status_code != 200:
-        # Không đưa response.text ra chat/log (API có thể echo Cookie).
+        # Tránh in response.text: nhà cung cấp có thể phản chiếu cookie trong lỗi.
+        if response.status_code == 503:
+            raise RuntimeError(
+                "API kiểm tra đơn hàng HTTP 503 qua KiotProxy (đã thử lại 1 lần "+
+                "bằng cùng IP). Kiểm tra mục Logs trên Render; không phải lỗi "+
+                "thiếu KIOTPROXY_KEY."
+            )
         raise RuntimeError(f"API kiểm tra đơn hàng lỗi HTTP {response.status_code} qua KiotProxy.")
     try:
         result = response.json()
