@@ -1,6 +1,6 @@
 """Telegram bot kiểm tra đơn Shopee và vận đơn SPX/GHN.
 
-Bản đồng bộ với order_service.py (KiotProxy bắt buộc cho Check Cookie, HTML preview).
+Bản đồng bộ với Vubel V7 + KiotProxy (proxy nằm trong JSON body gửi tới Vubel).
 Giữ Flask /api/ghn-track phục vụ Apps Script như mã gốc.
 """
 
@@ -177,62 +177,6 @@ def is_probably_shopee_cookie(s: str) -> bool:
     return len(t) >= 20 and SPC_ST_PATTERN.search(t) is not None
 
 
-def _get_any(d: Dict[str, Any], keys: List[str], default=None):
-    for k in keys:
-        if k in d and d[k] not in (None, "", [], {}):
-            return d[k]
-    return default
-
-
-def is_real_order(order: Dict[str, Any]) -> bool:
-    """Bao gồm orderSn/orderId và MVD nằm trong shipping.shipments[]."""
-    if not isinstance(order, dict):
-        return False
-    order_id = _get_any(
-        order, ["order_id", "orderid", "order_sn", "orderSn", "orderId", "id"], ""
-    )
-    tracking = _get_any(
-        order, ["tracking_number", "tracking_no", "tracking", "trackingNumber"], ""
-    )
-    shipping = order.get("shipping") or {}
-    if not tracking and isinstance(shipping, dict):
-        shipments = shipping.get("shipments") or []
-        if isinstance(shipments, list):
-            for shipment in shipments:
-                if isinstance(shipment, dict):
-                    tracking = _get_any(shipment, ["trackingNumber", "tracking_number"], "")
-                    if tracking:
-                        break
-    products = _get_any(order, ["product_info", "products", "items", "item_list"], [])
-    if isinstance(products, dict):
-        products = [products]
-    has_product = False
-    if isinstance(products, list):
-        for p in products:
-            if isinstance(p, dict) and _get_any(p, ["name", "product_name", "title", "item_name"], ""):
-                has_product = True
-                break
-    return bool(order_id) or bool(tracking) or has_product
-
-
-def count_real_orders_from_api(data: Dict[str, Any]) -> int:
-    if not isinstance(data, dict):
-        return 0
-    accs = data.get("allOrderDetails") or []
-    total = 0
-    if not isinstance(accs, list):
-        return 0
-    for account in accs:
-        if not isinstance(account, dict):
-            continue
-        orders = account.get("orderDetails") or []
-        if isinstance(orders, list):
-            for order in orders:
-                if is_real_order(order):
-                    total += 1
-    return total
-
-
 def _link_preview_options(msg: str) -> LinkPreviewOptions:
     """Ưu tiên URL Shopee có trong tin nhắn; không tải/gửi ảnh riêng."""
     match = SHOPEE_LINK_PATTERN.search(msg or "")
@@ -382,7 +326,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # 2) Cookie (có thể nhiều dòng)
+    # 2) Cookie (có thể nhiều dòng; Vubel nhận 1 cookie mỗi lần gọi)
     cookies = [line.strip() for line in raw.splitlines() if line.strip()]
     if not cookies:
         await update.message.reply_text("❌ Cookie trống. Gửi lại giúp mình nhé.")
@@ -407,21 +351,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("⏳ Đang check đơn hàng qua KiotProxy...")
+    await update.message.reply_text("⏳ Đang lấy đơn hàng bằng Vubel + KiotProxy...")
     try:
         data = await asyncio.to_thread(fetch_orders, cookies)
         if not isinstance(data, dict) or not isinstance(data.get("allOrderDetails"), list):
             await update.message.reply_text(
-                "❌ API trả dữ liệu không đúng cấu trúc allOrderDetails; không kết luận cookie hết hạn.",
-                reply_markup=continue_inline_keyboard(),
-            )
-            return
-
-        if count_real_orders_from_api(data) == 0:
-            await update.message.reply_text(
-                "ℹ️ API không trả về đơn hàng hợp lệ. Có thể tài khoản chưa có đơn, "
-                "cookie không còn hợp lệ hoặc API thiếu dữ liệu.\n"
-                "Không thể kết luận cookie hết hạn chỉ từ kết quả rỗng.",
+                "❌ Vubel không trả về danh sách đơn hợp lệ; không kết luận cookie hết hạn.",
                 reply_markup=continue_inline_keyboard(),
             )
             return
@@ -443,7 +378,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         # order_service.py đã giới hạn chi tiết lỗi API để không lộ cookie.
         await update.message.reply_text(
-            f"❌ Lỗi xử lý: {e}", reply_markup=continue_inline_keyboard()
+            f"❌ Lỗi Vubel: {e}", reply_markup=continue_inline_keyboard()
         )
 
 
