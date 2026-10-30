@@ -409,6 +409,61 @@ def _shipment(order):
     return ship, next((x for x in shipments if isinstance(x, dict)), {}) if isinstance(shipments, list) else {}
 
 
+def _shipping_service_text(order, ship, first_ship):
+    """Dịch vụ giao hàng chỉ hiện khi API thực sự trả thông tin."""
+    candidates = (
+        (first_ship, ("serviceName", "service_name", "shippingService", "shipping_service",
+                      "serviceType", "service_type", "deliveryService", "delivery_service")),
+        (ship, ("serviceName", "service_name", "shippingService", "shipping_service",
+                "shippingMethod", "shipping_method", "deliveryMethod", "delivery_method")),
+        (order, ("shippingService", "shipping_service", "shippingMethod", "shipping_method",
+                 "deliveryService", "delivery_service", "deliveryMethod", "delivery_method",
+                 "shipping_option", "shippingOption")),
+    )
+    for obj, keys in candidates:
+        value = _first(obj, *keys)
+        if isinstance(value, dict):
+            value = _first(value, "name", "label", "text", "description")
+        if isinstance(value, str) and value.strip():
+            # Chỉ chuẩn hóa đúng tên dịch vụ được khai báo.
+            raw = value.strip()
+            if raw.lower() in ("fast", "express", "nhanh"):
+                return "Nhanh"
+            return raw
+    return ""
+
+
+def _is_positive_money(value):
+    """Chỉ tạo câu 'vui lòng thanh toán' khi có khoản COD dương rõ ràng."""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, dict):
+        return _is_positive_money(_first(value, "amount", "value", "raw"))
+    digits = re.sub(r"[^0-9]", "", str(value))
+    return bool(digits and int(digits) > 0)
+
+
+def _is_cod_payment(order, ship):
+    """Không suy diễn COD chỉ từ tổng tiền đơn hàng."""
+    aliases = (
+        "payment_method", "paymentMethod", "payment_type", "paymentType",
+        "payment_option", "paymentOption", "payment_mode", "paymentMode",
+        "paymentMethodName", "payment_method_name", "paymentChannel", "payment_channel",
+    )
+    for obj in (order, ship):
+        value = _first(obj, *aliases)
+        if isinstance(value, dict):
+            value = _first(value, "name", "type", "code", "label", "description")
+        if not isinstance(value, str):
+            continue
+        val = value.lower().strip()
+        if re.search(r"\bcod\b|cash[ -]?on[ -]?delivery|thanh toán khi nhận hàng|thanh toan khi nhan hang|trả tiền khi nhận hàng|tra tien khi nhan hang", val):
+            return True
+    return False
+
+
 def _format_order(order, idx, max_products):
     ship, first_ship = _shipment(order)
     mvd = _first(order, "tracking", "trackingNumber", "tracking_number", "tracking_no") or _first(first_ship, "trackingNumber", "tracking_number")
@@ -421,7 +476,7 @@ def _format_order(order, idx, max_products):
             recent = _first(evt, "description", "buyer_description", "status_description") or ""
             if recent:
                 break
-    detail = recent or _first(order, "tracking_info_description", "delivery_status_description", "statusText")
+    detail = recent or _first(order, "tracking_info_description", "delivery_status_description", "statusText", "statusLabel")
     recipient = _first(order, "recipient", "receiver", "recipientAddress")
     rec = recipient if isinstance(recipient, dict) else {}
     person = _first(rec, "name", "recipient_name", "shipping_name") or (recipient if isinstance(recipient, str) else "")
@@ -429,27 +484,34 @@ def _format_order(order, idx, max_products):
     address = _first(rec, "address", "full_address", "shipping_address") or _first(order, "address", "full_address")
     if isinstance(address, dict):
         address = _first(address, "full_address", "address")
+
+    # total = tổng tiền đơn; KHÔNG dùng để suy diễn tiền phải trả khi nhận hàng.
     amount = _first(order, "total", "totalAmount", "total_amount", "totalPayment", "finalTotal")
-    cod = _first(order, "cod_amount", "cash_on_delivery_amount", "amount_to_collect") or _first(ship, "cod_amount")
+    cod = _first(order, "cod_amount", "codAmount", "cash_on_delivery_amount", "amount_to_collect", "amountToCollect")
+    if cod is None:
+        cod = _first(ship, "cod_amount", "codAmount", "amount_to_collect", "amountToCollect")
     placed = _time(_first(order, "createTime", "create_time", "orderTime", "order_time", "created_at", "ctime"))
     order_id = _first(order, "orderSn", "order_sn", "orderId", "order_id", "id")
     carrier = _first(first_ship, "carrierName", "carrier", "carrier_name") or _first(ship, "carrierName", "carrier", "carrier_name") or _first(order, "shippingCarrier", "carrier")
     if not carrier and mvd:
-        carrier = "Shopee Express" if str(mvd).upper().startswith("SPX") else "GHN" if str(mvd).upper().startswith("GY") else ""
-    lines = []
-    if idx > 1:
-        lines.append(f"📦 <b>ĐƠN HÀNG {idx}</b>")
-    lines.append("Tình trạng: " + _t(status or "Chưa có dữ liệu"))
-    if order_id:
-        lines.append("Mã đơn hàng: <code>" + _t(order_id) + "</code>")
+        carrier = "SPX Express" if str(mvd).upper().startswith("SPX") else "GHN" if str(mvd).upper().startswith("GY") else ""
+    service = _shipping_service_text(order, ship, first_ship)
+    is_cod = _is_cod_payment(order, ship) or _is_positive_money(cod)
+
+    def v(value, limit=450):
+        return _t(value, limit) if value is not None and str(value).strip() else "Chưa có dữ liệu"
+
+    lines = [f"📦 <b>ĐƠN HÀNG {idx}</b>",
+             "Tình trạng: " + v(status),
+             "Mã đơn hàng: " + ("<code>" + _t(order_id) + "</code>" if order_id else "Chưa có dữ liệu")]
     if placed:
-        lines.append("Thời gian đặt hàng: " + _t(placed))
-    lines.append("\n📦 <b>ĐỊA CHỈ NHẬN HÀNG</b>")
-    for value in (person, phone, address):
-        if value:
-            lines.append(_t(value))
-    if not any((person, phone, address)):
-        lines.append("API không trả thông tin nhận hàng")
+        lines.append("Thời gian đặt hàng: " + v(placed))
+
+    lines.extend(["", "📍 <b>THÔNG TIN NHẬN HÀNG</b>",
+                  "Tên: " + v(person),
+                  "Số điện thoại: " + v(phone),
+                  "Địa chỉ: " + v(address)])
+
     items = _item_lists(order)
     displayed = 0
     for item in items[:max_products]:
@@ -461,16 +523,14 @@ def _format_order(order, idx, max_products):
                      "quantityPurchased", "quantity_purchased", "item_quantity")
         unit_price, line_total = _price_from_item(item)
         link = _link(item, order)
-        lines_item = [f"\n🛍 <b>SẢN PHẨM {displayed + 1}</b>"]
-        if name:
-            lines_item.append("Tên sản phẩm: " + _t(name, 230))
+        lines_item = ["", f"🛍 <b>SẢN PHẨM {displayed + 1}</b>", "Tên sản phẩm: " + v(name, 230)]
         if variation:
-            lines_item.append("Phân loại: " + _t(variation, 100))
+            lines_item.append("Phân loại: " + v(variation, 100))
         if qty is not None:
-            lines_item.append("Số lượng: " + _t(qty))
-        lines_item.append("Giá sản phẩm: " + _t(unit_price or "API không cung cấp"))
+            lines_item.append("Số lượng: " + v(qty))
+        lines_item.append("Giá sản phẩm: " + v(unit_price))
         if line_total:
-            lines_item.append("Thành tiền sản phẩm: " + _t(line_total))
+            lines_item.append("Thành tiền sản phẩm: " + v(line_total))
         if link:
             lines_item.append("Liên kết: " + _t(link, 500))
         if len("\n".join(lines + lines_item)) > 2950:
@@ -478,20 +538,26 @@ def _format_order(order, idx, max_products):
         lines.extend(lines_item)
         displayed += 1
     if not items:
-        lines.append("\n🛍 <b>SẢN PHẨM</b>\nTên sản phẩm: API không cung cấp\nGiá sản phẩm: API không cung cấp")
+        lines.extend(["", "🛍 <b>SẢN PHẨM</b>",
+                      "Tên sản phẩm: API chưa cung cấp",
+                      "Giá sản phẩm: API chưa cung cấp"])
     elif displayed < len(items):
         lines.append(f"… còn {len(items) - displayed} sản phẩm không hiển thị trong tin này")
-    lines.append("\n🚚 <b>ĐƠN VỊ VẬN CHUYỂN</b>")
-    if carrier:
-        lines.append("Đơn vị vận chuyển: " + _t(carrier))
-    if mvd:
-        lines.append("Mã vận đơn: <code>" + _t(mvd) + "</code>")
-    if detail:
-        lines.append("Thông tin: " + _t(detail))
-    if amount is not None:
-        lines.append("Tổng thanh toán: " + _t(amount))
-    if cod is not None:
-        lines.append("💵 Tiền thu hộ (COD): " + _t(cod))
+
+    lines.extend(["", "🚚 <b>ĐƠN VỊ VẬN CHUYỂN</b>"])
+    if service:
+        service_line = service + (" (Thanh toán khi nhận hàng)" if is_cod else "")
+        lines.append(v(service_line))
+    elif is_cod:
+        lines.append("Thanh toán khi nhận hàng")
+    lines.extend(["Đơn vị vận chuyển: " + v(carrier),
+                  "Mã vận đơn: " + ("<code>" + _t(mvd) + "</code>" if mvd else "Chưa có mã vận đơn"),
+                  "Thông tin: " + v(detail)])
+
+    if _is_positive_money(cod):
+        lines.extend(["", "💵 <b>Vui lòng thanh toán " + v(_price_text(cod)) + " khi nhận hàng</b>"])
+    elif amount is not None:
+        lines.extend(["", "💵 <b>Tổng tiền đơn hàng: " + v(_price_text(amount)) + "</b>"])
     return "\n".join(lines)
 
 
