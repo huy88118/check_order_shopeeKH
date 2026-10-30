@@ -1,78 +1,70 @@
-"""Shopee order API via KiotProxy + Telegram HTML product-link preview.
+"""Shopee order check: Vubel V7 + KiotProxy, ported from user's Apps Script.
 
-Replace order_service.py in the repository with this file.
-Compatible with existing telegram_bot.py importing fetch_orders and
-format_orders_for_telegram; returns one Telegram message per order so each order
-can have its own Shopee link preview. No product images are sent separately.
+Telegram bot imports fetch_orders, format_orders_for_telegram, KiotProxyError.
+Vubel—not Autopee—receives Cookie header and JSON {"proxy":"http://..."}.
+Do not log API keys, cookie contents, proxy IP or full responses.
 """
+from __future__ import annotations
 
 import html
-import logging
 import os
 import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 from urllib.parse import urlparse, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
 
-BASE_URL = "https://us-central1-get-feedback-a0119.cloudfunctions.net/app"
-API_ENDPOINT = "/api/shopee/getOrderDetailsForCookie"
-HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-    "Origin": "https://autopee.vercel.app",
-    "Referer": "https://autopee.vercel.app/",
-}
-VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-_LOGGER = logging.getLogger(__name__)
-
-
-# Cùng quy tắc proxy với Google Apps Script, nhưng đây là kết nối HTTP(S)
-# thực qua proxy (không đưa {"proxy": ...} vào JSON của API Autopee).
+VUBEL_API_URL = "https://api.vubel.store/v1/shopee/get_order"
 KIOT_API = "https://api.kiotproxy.com/api/v1/proxies"
-KIOT_MIN_REMAINING_SECONDS = 120
-KIOT_REGIONS = frozenset({"random", "bac", "trung", "nam"})
-# Ngăn 2 lượt Check Cookie trong cùng tiến trình đổi IP khi lượt kia đang chạy.
-_PROXY_REQUEST_LOCK = threading.Lock()
+MIN_PROXY_SECONDS = 120
+REGIONS = {"random", "bac", "trung", "nam"}
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+_LOCK = threading.Lock()
+COOKIE_ERRORS = {"cookie_expired", "invalid_cookie", "invalid_spc_st", "session_expired"}
 
 
 class KiotProxyError(RuntimeError):
-    """Lỗi proxy đã làm sạch thông tin: không chứa API key hoặc cookie."""
+    """Safe-to-display proxy error without credentials."""
 
 
-def _kiot_config() -> tuple[str, str]:
+class VubelError(RuntimeError):
+    """Safe-to-display Vubel error without cookies or keys."""
+
+
+def _config():
     key = os.getenv("KIOTPROXY_KEY", "").strip()
+    vubel = os.getenv("VUBEL_API_KEY", "").strip()
     region = os.getenv("KIOTPROXY_REGION", "random").strip().lower() or "random"
     if not key:
-        raise KiotProxyError("Chưa cấu hình KIOTPROXY_KEY trong Render Environment.")
-    if region not in KIOT_REGIONS:
-        raise KiotProxyError("KIOTPROXY_REGION chỉ nhận random, bac, trung hoặc nam.")
-    return key, region
+        raise KiotProxyError("Render chưa có KIOTPROXY_KEY.")
+    if not vubel:
+        raise VubelError("Render chưa có VUBEL_API_KEY (cùng loại key đang dùng ở Apps Script).")
+    if region not in REGIONS:
+        raise KiotProxyError("KIOTPROXY_REGION chỉ nhận random/bac/trung/nam.")
+    return key, vubel, region
 
 
-def _kiot_get(session: requests.Session, key: str, action: str,
-              region: Optional[str] = None) -> Optional[dict]:
-    """GET /current hoặc /new. Tuyệt đối không log URL chứa key."""
+def _kiot_get(session: requests.Session, key: str, action: str, region: str = ""):
     params = {"key": key}
     if region:
         params["region"] = region
     try:
         response = session.get(
-            f"{KIOT_API}/{action}", params=params,
-            headers={"Accept": "application/json"}, timeout=(10, 15),
+            KIOT_API + "/" + action, params=params,
+            headers={"Accept": "application/json"}, timeout=(10, 20),
         )
     except requests.RequestException:
-        raise KiotProxyError("Không kết nối được KiotProxy. Đã ngừng check.") from None
+        raise KiotProxyError("Không kết nối được KiotProxy.") from None
     try:
         payload = response.json()
     except (ValueError, TypeError):
-        raise KiotProxyError("KiotProxy không trả JSON hợp lệ. Đã ngừng check.") from None
+        raise KiotProxyError("KiotProxy trả dữ liệu không phải JSON.") from None
     if not isinstance(payload, dict):
-        raise KiotProxyError("Dữ liệu KiotProxy không đúng định dạng.")
+        raise KiotProxyError("Phản hồi KiotProxy không hợp lệ.")
     code = payload.get("error")
     if isinstance(code, dict):
         code = code.get("code")
@@ -80,391 +72,336 @@ def _kiot_get(session: requests.Session, key: str, action: str,
         return None
     if response.status_code != 200 or payload.get("success") is not True:
         raise KiotProxyError(
-            f"KiotProxy {action} lỗi HTTP {response.status_code}; "
-            "kiểm tra key, thời hạn hoặc thời gian chờ đổi IP."
+            f"KiotProxy {action} lỗi HTTP {response.status_code}; kiểm tra hạn key/ttc."
         )
     return payload
 
 
-def _kiot_lease(payload: dict) -> dict:
-    """Kiot timestamps theo mili-giây như Code.gs; tính thời gian bằng monotonic."""
+def _lease(payload: dict):
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise KiotProxyError("KiotProxy thiếu dữ liệu proxy.")
-    raw_proxy = str(data.get("http") or "").strip()
-    if not raw_proxy or any(ch in raw_proxy for ch in " /?#@\r\n\t"):
-        raise KiotProxyError("KiotProxy trả host:port HTTP không hợp lệ.")
+        raise KiotProxyError("KiotProxy thiếu data.")
+    proxy = str(data.get("http") or "").strip()
     try:
-        parsed = urlsplit("http://" + raw_proxy)
-        if not parsed.hostname or parsed.port is None or not (1 <= parsed.port <= 65535):
+        if not proxy or any(ch in proxy for ch in " /?#@\r\n\t"):
             raise ValueError()
-        if parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        parsed = urlsplit("http://" + proxy)
+        if not parsed.hostname or not parsed.port or parsed.username or parsed.password:
             raise ValueError()
-    except ValueError:
-        raise KiotProxyError("KiotProxy trả host:port HTTP không hợp lệ.") from None
-    try:
-        expiry = float(data["expirationAt"])
+        expiry_ms = float(data["expirationAt"])
         server_ms = float(payload.get("timestamp") or time.time() * 1000)
-        if expiry < 1e11 or server_ms < 1e11:
+        if expiry_ms < 1e11 or server_ms < 1e11:
             raise ValueError()
         ttc = max(0.0, float(data.get("ttc") or 0))
-        next_at = float(data.get("nextRequestAt") or 0)
-    except (ValueError, TypeError, KeyError, OverflowError):
-        raise KiotProxyError("KiotProxy thiếu thời gian expirationAt/ttc hợp lệ.") from None
+        next_ms = float(data.get("nextRequestAt") or 0)
+    except (ValueError, KeyError, TypeError, OverflowError):
+        raise KiotProxyError("KiotProxy trả proxy/thời hạn không hợp lệ.") from None
     now = time.monotonic()
     return {
-        "proxy_url": "http://" + raw_proxy,
-        "remaining_until": now + max(0.0, (expiry - server_ms) / 1000),
-        "change_until": now + max(0.0, ttc, (next_at - server_ms) / 1000),
+        "proxy": "http://" + proxy,
+        "remaining_until": now + max(0, (expiry_ms - server_ms) / 1000),
+        "change_until": now + max(ttc, (next_ms - server_ms) / 1000, 0),
     }
 
 
-def _remaining(lease: dict) -> float:
+def _remaining(lease):
     return max(0.0, lease["remaining_until"] - time.monotonic())
 
 
-def _acquire_kiot_proxy(session: requests.Session, key: str, region: str) -> str:
-    current = _kiot_get(session, key, "current")
-    lease = _kiot_lease(current) if current is not None else None
-    if lease and _remaining(lease) >= KIOT_MIN_REMAINING_SECONDS:
-        return lease["proxy_url"]
-    if lease:
-        wait = max(0.0, lease["change_until"] - time.monotonic())
-        if wait > 0:
-            raise KiotProxyError(
-                f"Proxy còn dưới {KIOT_MIN_REMAINING_SECONDS} giây và chưa thể đổi IP; "
-                f"thử lại sau khoảng {int(wait + 0.999)} giây."
-            )
-    new_payload = _kiot_get(session, key, "new", region)
-    new_lease = _kiot_lease(new_payload)
-    if _remaining(new_lease) < KIOT_MIN_REMAINING_SECONDS:
-        raise KiotProxyError("Proxy mới còn dưới 120 giây; dừng check để tránh lỗi.")
-    return new_lease["proxy_url"]
+def _acquire(session, key, region):
+    reply = _kiot_get(session, key, "current")
+    lease = _lease(reply) if reply else None
+    if lease and _remaining(lease) >= MIN_PROXY_SECONDS:
+        return lease
+    if lease and lease["change_until"] > time.monotonic():
+        waiting = int(lease["change_until"] - time.monotonic() + 0.999)
+        raise KiotProxyError(f"IP còn dưới 120 giây; Kiot chưa cho đổi. Thử lại sau {waiting} giây.")
+    lease = _lease(_kiot_get(session, key, "new", region))
+    if _remaining(lease) < MIN_PROXY_SECONDS:
+        raise KiotProxyError("Proxy mới còn dưới 120 giây; không gửi request.")
+    return lease
 
 
-def fetch_orders(cookies_list: List[str]) -> Dict[str, Any]:
-    """Check Cookie Shopee bắt buộc đi qua KiotProxy; không direct fallback.
-
-    - Dùng lại IP nếu còn >= 120s, tôn trọng ttc/nextRequestAt.
-    - Gửi đúng JSON {"cookies": [...]} tới Autopee qua requests proxies.
-    - Không gửi Vubel key/proxy JSON tới Autopee và không log cookie/key/IP.
-    - GHN/SPX trong tracking_service không bị thay đổi.
-    """
-    if not cookies_list:
-        raise ValueError("Danh sách cookie trống.")
-    key, region = _kiot_config()
-    # Khóa bao cả thời gian POST, tránh tự đổi IP giữa hai check chạy đồng thời.
-    with _PROXY_REQUEST_LOCK:
-        with requests.Session() as session:
-            # Không sử dụng proxy môi trường của máy chủ thay thế KiotProxy.
-            session.trust_env = False
-            proxy_url = _acquire_kiot_proxy(session, key, region)
-            # 503 thường là lỗi tạm thời ở dịch vụ đích hoặc gateway. Chỉ thử lại
-            # tối đa một lần với CÙNG proxy; tuyệt đối không fallback direct hoặc
-            # xin IP mới trong lúc API đang báo 503.
-            for attempt in range(2):
-                try:
-                    response = session.post(
-                        BASE_URL + API_ENDPOINT,
-                        json={"cookies": cookies_list},
-                        headers=HEADERS,
-                        proxies={"http": proxy_url, "https": proxy_url},
-                        timeout=(15, 60),
-                    )
-                except requests.exceptions.ProxyError:
-                    raise KiotProxyError("Không kết nối được HTTP proxy KiotProxy; dừng check.") from None
-                except requests.exceptions.Timeout:
-                    raise KiotProxyError("Quá thời gian chờ API qua KiotProxy; thử lại sau.") from None
-                except requests.RequestException:
-                    raise RuntimeError("Lỗi kết nối API đơn hàng qua proxy; không gửi trực tiếp.") from None
-
-                # Chỉ log các header vô hại, KHÔNG log response body, cookie,
-                # IP proxy, key hoặc full URL. Header server/via có thể giúp
-                # nhận biết 503 do gateway proxy hay cloud function trả về.
-                if response.status_code >= 500:
-                    safe_headers = {}
-                    for field in ("Server", "Via", "Content-Type", "Retry-After"):
-                        value = str(response.headers.get(field, ""))[:100]
-                        value = re.sub(r"[^a-zA-Z0-9_. /;:+\-]", "?", value)
-                        if value:
-                            safe_headers[field] = value
-                    _LOGGER.warning(
-                        "Shopee order API: HTTP %s, attempt=%s/2, response_headers=%s",
-                        response.status_code, attempt + 1, safe_headers,
-                    )
-
-                if response.status_code != 503 or attempt == 1:
-                    break
-                time.sleep(2)
-
-    if response.status_code != 200:
-        # Tránh in response.text: nhà cung cấp có thể phản chiếu cookie trong lỗi.
-        if response.status_code == 503:
-            raise RuntimeError(
-                "API kiểm tra đơn hàng HTTP 503 qua KiotProxy (đã thử lại 1 lần "+
-                "bằng cùng IP). Kiểm tra mục Logs trên Render; không phải lỗi "+
-                "thiếu KIOTPROXY_KEY."
-            )
-        raise RuntimeError(f"API kiểm tra đơn hàng lỗi HTTP {response.status_code} qua KiotProxy.")
-    try:
-        result = response.json()
-    except (ValueError, TypeError):
-        raise RuntimeError("API đơn hàng không trả JSON hợp lệ.") from None
-    if not isinstance(result, dict):
-        raise RuntimeError("API đơn hàng trả dữ liệu không đúng cấu trúc JSON object.")
-    return result
+def _parse_cookie(raw):
+    raw = str(raw or "").strip()
+    raw = re.sub(r"^Cookie:\s*", "", raw, flags=re.I)
+    st = re.search(r"(?:^|;\s*)SPC_ST\s*=\s*([^;\s]+)", raw, flags=re.I)
+    if not st:
+        raise ValueError("Cookie phải chứa SPC_ST=... hợp lệ.")
+    fp = re.search(r"(?:^|;\s*)SPC_F\s*=\s*([^;\s]+)", raw, flags=re.I)
+    return "SPC_ST=" + st.group(1) + (("; SPC_F=" + fp.group(1)) if fp else "")
 
 
-def h(x: Any) -> str:
-    return html.escape("" if x is None else str(x), quote=False)
-
-
-def _get(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
-    if not isinstance(d, dict):
-        return default
-    for key in keys:
-        if key in d and d[key] not in (None, "", [], {}):
-            return d[key]
-    return default
-
-
-def _fmt_ts(ts: Any) -> str:
-    if ts in (None, ""):
+def _error_code(payload):
+    if not isinstance(payload, dict):
         return ""
-    if isinstance(ts, datetime):
-        dt = ts
-    elif isinstance(ts, (int, float)) or (isinstance(ts, str) and re.fullmatch(r"\d{10,13}", ts.strip())):
-        n = float(ts)
-        dt = datetime.fromtimestamp(n / 1000 if n > 1e11 else n, tz=timezone.utc)
-    elif isinstance(ts, str):
-        s = ts.strip()
-        try:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except ValueError:
-            # Preserve already-human-readable API dates; don't invent timestamps.
-            return s[:80]
-    else:
-        return str(ts)[:80]
-    if dt.tzinfo is None:
-        # API could already be returning local naive time; keep wall time.
-        return dt.strftime("%d/%m/%Y %H:%M:%S")
-    return dt.astimezone(VN_TZ).strftime("%d/%m/%Y %H:%M:%S")
-
-
-def _fmt_money_from_api(v: Any) -> str:
-    """Display currency only when API provides a value; supports 1e5 Shopee scale."""
-    if v in (None, ""):
-        return ""
-    try:
-        raw = str(v).replace(",", "").replace("₫", "").replace("đ", "").strip()
-        amount = float(raw)
-        if abs(amount) >= 1_000_000_000:
-            # Shopee integer prices are often in 1/100000 VND units.
-            amount /= 100_000
-        return f"{amount:,.0f}".replace(",", ".") + "đ"
-    except (ValueError, TypeError, OverflowError):
-        return str(v)[:80]
-
-
-def _build_shopee_link(shop_id: Any, item_id: Any) -> Optional[str]:
-    try:
-        if shop_id and item_id:
-            return f"https://shopee.vn/product/{int(shop_id)}/{int(item_id)}"
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-def _safe_trim(s: Any, n: int) -> str:
-    text = "" if s is None else str(s).strip()
-    return text if len(text) <= n else text[:n - 1] + "…"
-
-
-def _split_address_for_ui(full_address: Any) -> Tuple[str, str]:
-    address = "" if full_address is None else str(full_address).strip()
-    if not address:
-        return "", ""
-    parts = [p.strip() for p in address.split(",") if p.strip()]
-    if len(parts) >= 2:
-        return ", ".join(parts[:-1]), parts[-1]
-    return address, ""
-
-
-def _detect_carrier_from_tracking(tracking_id: Any) -> str:
-    code = str(tracking_id or "").strip().upper()
-    if code.startswith("SPX"):
-        return "Shopee Express"
-    if code.startswith("GY"):
-        return "Giao Hàng Nhanh"
+    err = payload.get("error")
+    fields = [err if isinstance(err, str) else err.get("code") if isinstance(err, dict) else None,
+              payload.get("error_code"), payload.get("errorCode"), payload.get("code")]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        fields.append(data.get("error"))
+    for code in fields:
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", code.strip()):
+            return code.strip().lower()
     return ""
 
 
-def _safe_shopee_url(url: Any) -> Optional[str]:
-    """Allow real Shopee product links (including shortened Shopee URLs)."""
-    if not isinstance(url, str) or not url.strip():
-        return None
-    candidate = url.strip()
+def _fetch_vubel(session, api_key, cookie, proxy_url):
+    # Exactly the same transport contract as user's Apps Script:
+    # HTTP request Render -> Vubel direct; Vubel -> Shopee through proxy in JSON.
     try:
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").lower()
-        if (parsed.scheme == "https" and
-                (host == "shopee.vn" or host.endswith(".shopee.vn") or
-                 host == "shope.ee" or host.endswith(".shope.ee")) and
-                not any(ch in candidate for ch in "\n\r\t <>\"'")):
-            return candidate
-    except ValueError:
-        pass
+        response = session.post(
+            VUBEL_API_URL,
+            headers={"x-api-key": api_key, "Cookie": cookie,
+                     "Accept": "application/json", "Content-Type": "application/json"},
+            json={"proxy": proxy_url},
+            allow_redirects=False,
+            timeout=(15, 60),
+        )
+    except requests.RequestException:
+        raise VubelError("Không kết nối được Vubel; không kết luận cookie chết.") from None
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        raise VubelError(f"Vubel HTTP {response.status_code} không trả JSON hợp lệ.") from None
+    if not isinstance(payload, dict):
+        raise VubelError("Vubel trả JSON không phải object.")
+    errcode = _error_code(payload)
+    if payload.get("ok") is not True and errcode in COOKIE_ERRORS:
+        return {"cookieInvalid": True, "orders": [], "account": {}}
+    if response.status_code != 200 or payload.get("ok") is not True:
+        detail = " | error=" + errcode if errcode else ""
+        raise VubelError(
+            f"Vubel HTTP {response.status_code}{detail}; lỗi API/key không đồng nghĩa cookie hết hạn."
+        )
+    data = payload.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("orders"), list):
+        raise VubelError("Vubel thiếu data.orders; không thể kết luận tài khoản không có đơn.")
+    return {"cookieInvalid": False, "orders": data["orders"],
+            "account": data.get("account") if isinstance(data.get("account"), dict) else {}}
+
+
+def fetch_orders(cookies_list: list[str]) -> dict:
+    """Call Vubel *once per SPC_ST*, not the Autopee cookies[] endpoint.
+
+    Return a compatibility envelope for telegram_bot.py. Each account includes
+    orderDetails (Vubel data.orders); cookieInvalid true only on explicit error.
+    """
+    if not cookies_list:
+        raise ValueError("Danh sách Cookie trống.")
+    kiot_key, vubel_key, region = _config()
+    accounts = []
+    # Lock prevents parallel checks from conflicting on a rotating shared proxy.
+    with _LOCK:
+        with requests.Session() as session:
+            session.trust_env = False
+            lease = None
+            for index, raw in enumerate(cookies_list, start=1):
+                try:
+                    cookie = _parse_cookie(raw)
+                except ValueError:
+                    accounts.append({"cookie_index": index, "cookieInvalid": False,
+                                     "error": "Cookie sai định dạng SPC_ST", "orderDetails": []})
+                    continue
+                if lease is None or _remaining(lease) < MIN_PROXY_SECONDS:
+                    lease = _acquire(session, kiot_key, region)
+                result = _fetch_vubel(session, vubel_key, cookie, lease["proxy"])
+                account = dict(result["account"])
+                account.update({"cookie_index": index, "cookieInvalid": result["cookieInvalid"],
+                                "orderDetails": result["orders"]})
+                accounts.append(account)
+    return {"source": "vubel", "allOrderDetails": accounts}
+
+
+def _first(obj, *keys):
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        value = obj.get(key)
+        if value is not None and value != "" and value != [] and value != {}:
+            return value
     return None
 
 
-def _product_link(product: Dict[str, Any], order: Dict[str, Any]) -> Optional[str]:
-    # Respect a direct/short product URL from API first, if available.
-    for key in ("product_url", "product_link", "item_url", "item_link", "link", "url", "shopee_url", "share_url"):
-        url = _safe_shopee_url(product.get(key))
-        if url:
-            return url
-    return _build_shopee_link(
-        _get(product, ["shop_id", "shopid", "shopId"], _get(order, ["shop_id", "shopid", "shopId"])),
-        _get(product, ["item_id", "itemid", "itemId", "product_id", "productId"]),
-    )
+def _t(v, length=450):
+    return html.escape(str(v).strip()[:length], quote=False) if v is not None else ""
 
 
-def _first_object(d: Dict[str, Any], keys: List[str]) -> Dict[str, Any]:
-    value = _get(d, keys, {})
-    return value if isinstance(value, dict) else {}
+def _time(v):
+    if v in (None, ""):
+        return ""
+    try:
+        if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\d{10,13}", v)):
+            x = float(v)
+            if x > 1e11:
+                x /= 1000
+            return datetime.fromtimestamp(x, tz=timezone.utc).astimezone(VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
+        if isinstance(v, str):
+            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return dt.astimezone(VN_TZ).strftime("%H:%M:%S %d/%m/%Y") if dt.tzinfo else v
+    except (OverflowError, ValueError, TypeError):
+        pass
+    return str(v)[:80]
 
 
-def _payment_description(order: Dict[str, Any], shipping: Dict[str, Any]) -> str:
-    name = _get(shipping, ["shipping_method", "shipping_service", "shipping_service_name", "shipping_option_name", "shipping_name", "service_name"], "")
-    method = _get(order, ["payment_method_name", "payment_method", "payment_type"], "")
-    if not name:
-        name = _get(order, ["shipping_method", "shipping_service", "shipping_option_name"], "")
-    if name and method:
-        return f"{name} ({method})"
-    return str(name or method or "")
+def _link(item, order):
+    if not isinstance(item, dict):
+        return ""
+    for name in ("product_url", "product_link", "item_url", "item_link", "shopee_url", "share_url", "url", "link"):
+        url = _first(item, name)
+        if isinstance(url, str):
+            try:
+                p = urlparse(url)
+                host = (p.hostname or "").lower()
+                if p.scheme == "https" and (host == "shopee.vn" or host.endswith(".shopee.vn")
+                    or host == "shope.ee" or host.endswith(".shope.ee")):
+                    return url
+            except ValueError:
+                pass
+    shop = _first(item, "shop_id", "shopid", "shopId") or _first(order, "shop_id", "shopid", "shopId")
+    product = _first(item, "item_id", "itemid", "itemId", "product_id", "productId")
+    if shop and product and str(shop).isdigit() and str(product).isdigit():
+        return f"https://shopee.vn/product/{shop}/{product}"
+    return ""
 
 
-def _cod_amount(order: Dict[str, Any], shipping: Dict[str, Any]) -> str:
-    # Do not substitute order total for COD; they are different concepts.
-    fields = ["cod_amount", "cod_price", "cod_total", "cash_on_delivery_amount", "amount_to_collect"]
-    raw = _get(order, fields, None)
-    if raw is None:
-        raw = _get(shipping, fields, None)
-    return _fmt_money_from_api(raw)
+def _item_lists(order):
+    items = _first(order, "items", "products", "product_info", "item_list") or []
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        items = []
+    # Some Vubel payloads may group products in shops[].items.
+    if not items:
+        shops = _first(order, "shops") or []
+        if isinstance(shops, list):
+            for shop in shops:
+                if isinstance(shop, dict):
+                    nested = _first(shop, "items", "products", "item_list") or []
+                    if isinstance(nested, list):
+                        for item in nested:
+                            if isinstance(item, dict):
+                                items.append(dict(item, shop_id=item.get("shop_id") or shop.get("shopId") or shop.get("shop_id")))
+    return [x for x in items if isinstance(x, dict)]
 
 
-def _format_one_order(order: Dict[str, Any], idx: int, max_products_per_order: int) -> str:
-    order_id = _get(order, ["order_id", "orderid", "order_sn", "orderSn", "id"], "")
-    status = _get(order, ["status_description", "status", "order_status", "tracking_info_description"], "")
-    delivery_status = _get(order, ["tracking_info_description", "delivery_status_description", "shipping_status"], "")
-    placed = _fmt_ts(_get(order, ["create_time", "order_time", "ctime", "created_at", "created_time", "order_created_at"], ""))
-    address = _first_object(order, ["address", "recipient", "shipping_address"])
-    person = _get(address, ["shipping_name", "name", "receiver_name", "recipient_name"], "")
-    phone = _get(address, ["shipping_phone", "phone", "receiver_phone", "recipient_phone"], "")
-    addr = _get(address, ["shipping_address", "address", "full_address", "address_full"], "")
-    if isinstance(addr, dict):
-        addr = _get(addr, ["full_address", "address"], "")
-    shipping = _first_object(order, ["shipping", "shipment", "logistics"])
-    tracking = _get(order, ["tracking_number", "tracking_no", "tracking", "tracking_id"], "")
-    carrier = _detect_carrier_from_tracking(tracking) or _get(shipping, ["shipping_carrier", "carrier", "carrier_name"], "") or _get(order, ["shipping_carrier"], "")
-    products = _get(order, ["product_info", "products", "items", "item_list"], [])
-    if isinstance(products, dict):
-        products = [products]
-    if not isinstance(products, list):
-        products = []
+def _shipment(order):
+    ship = _first(order, "shipping", "shipment", "logistics") or {}
+    if not isinstance(ship, dict):
+        return {}, {}
+    shipments = ship.get("shipments") or []
+    return ship, next((x for x in shipments if isinstance(x, dict)), {}) if isinstance(shipments, list) else {}
 
-    parts: List[str] = []
+
+def _format_order(order, idx, max_products):
+    ship, first_ship = _shipment(order)
+    mvd = _first(order, "tracking", "trackingNumber", "tracking_number", "tracking_no") or _first(first_ship, "trackingNumber", "tracking_number")
+    status = _first(order, "statusLabel", "statusText", "status_description", "statusKey", "status", "order_status")
+    events = _first(first_ship, "events") or _first(order, "events") or []
+    recent = ""
+    if isinstance(events, list):
+        ordered = sorted((e for e in events if isinstance(e, dict)), key=lambda e: float(e.get("timestamp") or 0) if str(e.get("timestamp") or "").replace(".", "", 1).isdigit() else 0, reverse=True)
+        for evt in ordered:
+            recent = _first(evt, "description", "buyer_description", "status_description") or ""
+            if recent:
+                break
+    detail = recent or _first(order, "tracking_info_description", "delivery_status_description", "statusText")
+    recipient = _first(order, "recipient", "receiver", "recipientAddress")
+    rec = recipient if isinstance(recipient, dict) else {}
+    person = _first(rec, "name", "recipient_name", "shipping_name") or (recipient if isinstance(recipient, str) else "")
+    phone = _first(rec, "phone", "recipient_phone") or _first(order, "phone", "recipientPhone")
+    address = _first(rec, "address", "full_address", "shipping_address") or _first(order, "address", "full_address")
+    if isinstance(address, dict):
+        address = _first(address, "full_address", "address")
+    amount = _first(order, "total", "totalAmount", "total_amount", "totalPayment", "finalTotal")
+    cod = _first(order, "cod_amount", "cash_on_delivery_amount", "amount_to_collect") or _first(ship, "cod_amount")
+    placed = _time(_first(order, "createTime", "create_time", "orderTime", "order_time", "created_at", "ctime"))
+    order_id = _first(order, "orderSn", "order_sn", "orderId", "order_id", "id")
+    carrier = _first(first_ship, "carrierName", "carrier", "carrier_name") or _first(ship, "carrierName", "carrier", "carrier_name") or _first(order, "shippingCarrier", "carrier")
+    if not carrier and mvd:
+        carrier = "Shopee Express" if str(mvd).upper().startswith("SPX") else "GHN" if str(mvd).upper().startswith("GY") else ""
+    lines = []
     if idx > 1:
-        parts.append(f"📦 <b>ĐƠN HÀNG {idx}</b>")
-    parts.append("Tình trạng: " + h(status or "Chưa có dữ liệu"))
-    parts.append("Mã đơn hàng: " + (f"<code>{h(order_id)}</code>" if order_id else "Chưa có dữ liệu"))
-    parts.append("Thời gian đặt hàng: " + h(placed or "Chưa có dữ liệu"))
-    parts.append("\n📦 <b>ĐỊA CHỈ NHẬN HÀNG</b>")
-    for val in (person, phone, addr):
-        if val:
-            parts.append(h(_safe_trim(val, 400)))
-    if not any((person, phone, addr)):
-        parts.append("Chưa có thông tin người nhận")
-
-    for pidx, product in enumerate(products[:max_products_per_order], start=1):
-        if not isinstance(product, dict):
-            continue
-        parts.append(f"\n🛍 <b>SẢN PHẨM {pidx}</b>")
-        name = _get(product, ["name", "product_name", "title", "item_name"], "")
-        variation = _get(product, ["model_name", "variation", "classification", "model", "variation_name"], "")
-        qty = _get(product, ["quantity", "qty", "amount", "item_count"], None)
+        lines.append(f"📦 <b>ĐƠN HÀNG {idx}</b>")
+    lines.append("Tình trạng: " + _t(status or "Chưa có dữ liệu"))
+    if order_id:
+        lines.append("Mã đơn hàng: <code>" + _t(order_id) + "</code>")
+    if placed:
+        lines.append("Thời gian đặt hàng: " + _t(placed))
+    lines.append("\n📦 <b>ĐỊA CHỈ NHẬN HÀNG</b>")
+    for value in (person, phone, address):
+        if value:
+            lines.append(_t(value))
+    if not any((person, phone, address)):
+        lines.append("API không trả thông tin nhận hàng")
+    items = _item_lists(order)
+    displayed = 0
+    for item in items[:max_products]:
+        name = _first(item, "name", "itemName", "product_name", "title", "item_name")
+        variation = _first(item, "variation", "model_name", "modelName", "model", "variation_name")
+        qty = _first(item, "quantity", "qty", "model_quantity_purchased")
+        link = _link(item, order)
+        lines_item = [f"\n🛍 <b>SẢN PHẨM {displayed + 1}</b>"]
         if name:
-            parts.append("Tên sản phẩm: " + h(_safe_trim(name, 220)))
+            lines_item.append("Tên sản phẩm: " + _t(name, 230))
         if variation:
-            parts.append("Phân loại: " + h(_safe_trim(variation, 120)))
-        if qty not in (None, ""):
-            parts.append("Số lượng: " + h(qty))
-        link = _product_link(product, order)
+            lines_item.append("Phân loại: " + _t(variation, 100))
+        if qty is not None:
+            lines_item.append("Số lượng: " + _t(qty))
         if link:
-            # Plain visible URL: Telegram can produce a native product preview.
-            parts.append("Liên kết: " + h(link))
-    if len(products) > max_products_per_order:
-        parts.append(f"… và {len(products) - max_products_per_order} sản phẩm khác")
-
-    parts.append("\n🚚 <b>ĐƠN VỊ VẬN CHUYỂN</b>")
-    method = _payment_description(order, shipping)
-    if method:
-        parts.append(h(method))
+            lines_item.append("Liên kết: " + _t(link, 500))
+        if len("\n".join(lines + lines_item)) > 2950:
+            break
+        lines.extend(lines_item)
+        displayed += 1
+    if not items:
+        lines.append("\n🛍 <b>SẢN PHẨM</b>\nAPI không trả chi tiết sản phẩm/link")
+    elif displayed < len(items):
+        lines.append(f"… còn {len(items) - displayed} sản phẩm không hiển thị trong tin này")
+    lines.append("\n🚚 <b>ĐƠN VỊ VẬN CHUYỂN</b>")
     if carrier:
-        parts.append("Đơn vị vận chuyển: " + h(carrier))
-    if tracking:
-        parts.append("Mã vận đơn: <code>" + h(tracking) + "</code>")
-    if delivery_status:
-        parts.append("Thông tin: " + h(_safe_trim(delivery_status, 300)))
-    cod = _cod_amount(order, shipping)
-    if cod:
-        parts.append("\n💵 Vui lòng thanh toán " + h(cod) + " khi nhận hàng")
-
-    # Avoid invalid HTML resulting from arbitrarily slicing a message mid-tag.
-    text = "\n".join(parts).strip()
-    if len(text) > 3900:
-        # Shorten the free-form fields by dropping longer sections (keep product URL).
-        parts = [p for p in parts if len(p) <= 450]
-        text = "\n".join(parts).strip()
-    if len(text) > 3900:
-        # This is exceptionally long; retain the link and the most important fields.
-        core = [p for p in parts if len(p) < 240]
-        text = "\n".join(core).strip()
-    return text
+        lines.append("Đơn vị vận chuyển: " + _t(carrier))
+    if mvd:
+        lines.append("Mã vận đơn: <code>" + _t(mvd) + "</code>")
+    if detail:
+        lines.append("Thông tin: " + _t(detail))
+    if amount is not None:
+        lines.append("Tổng thanh toán: " + _t(amount))
+    if cod is not None:
+        lines.append("💵 Tiền thu hộ (COD): " + _t(cod))
+    return "\n".join(lines)
 
 
-def format_orders_for_telegram(
-    data: Dict[str, Any],
-    max_orders_per_cookie: int = 5,
-    max_products_per_order: int = 5,
-) -> List[str]:
-    """Return one HTML-safe Telegram message per order.
-
-    The existing telegram_bot.py sends the returned messages via reply_text with
-    parse_mode='HTML', allowing Telegram to preview the first Shopee product URL.
-    Product photos are NOT downloaded or sent via Telegram's photo API.
-    """
-    accounts = data.get("allOrderDetails") or []
-    if not isinstance(accounts, list) or not accounts:
-        return ["❌ Không có dữ liệu đơn hàng. (API trả rỗng)"]
-
-    messages: List[str] = []
+def format_orders_for_telegram(data: dict, max_orders_per_cookie: int = 5,
+                               max_products_per_order: int = 5) -> list[str]:
+    """Format Vubel data.orders per cookie, keeping plain Shopee product URL preview."""
+    accounts = data.get("allOrderDetails") if isinstance(data, dict) else None
+    if not isinstance(accounts, list):
+        return ["❌ API Vubel trả dữ liệu không hợp lệ."]
+    messages = []
+    multiple = len(accounts) > 1
     for account in accounts:
         if not isinstance(account, dict):
             continue
+        index = account.get("cookie_index", 1)
+        prefix = f"🍪 <b>COOKIE {index}</b>\n" if multiple else ""
+        if account.get("cookieInvalid"):
+            messages.append(prefix + "❌ Cookie die / Hết hạn (Vubel xác nhận).")
+            continue
+        if account.get("error"):
+            messages.append(prefix + "❌ " + _t(account["error"]))
+            continue
         orders = account.get("orderDetails") or []
         if not isinstance(orders, list):
+            messages.append(prefix + "❌ Dữ liệu đơn hàng không hợp lệ.")
             continue
         if not orders:
-            messages.append("❌ Không có đơn hàng trong tài khoản này.")
+            messages.append(prefix + "ℹ️ Vubel trả về 0 đơn hàng; không kết luận cookie hết hạn.")
             continue
-        for idx, order in enumerate(orders[:max_orders_per_cookie], start=1):
-            if not isinstance(order, dict):
-                continue
-            msg = _format_one_order(order, idx, max_products_per_order)
-            if msg:
-                messages.append(msg)
-        omitted = len(orders) - max_orders_per_cookie
-        if omitted > 0:
-            messages.append(f"ℹ️ Còn {omitted} đơn chưa hiển thị (giới hạn mỗi cookie: {max_orders_per_cookie}).")
-    return messages or ["❌ Không có dữ liệu đơn hàng hợp lệ."]
+        for idx, order in enumerate(orders[:max_orders_per_cookie], 1):
+            if isinstance(order, dict):
+                messages.append(prefix + _format_order(order, idx, max_products_per_order))
+        if len(orders) > max_orders_per_cookie:
+            messages.append(prefix + f"ℹ️ Chưa hiển thị {len(orders) - max_orders_per_cookie} đơn vì giới hạn tin nhắn.")
+    return messages or ["ℹ️ Không có đơn hàng để hiển thị."]
